@@ -409,7 +409,7 @@ void WebSocketReceiver::onData(evbuffer* buf) {
                 handlePingFrame(payload.data(), payload.size());
                 break;
             case 0x0A:
-                log_debug("Received pong frame");
+                _sinks.onRxPong(std::move(payload));
                 break;
             default:
                 log_error("Unknown opcode: %d", opcode);
