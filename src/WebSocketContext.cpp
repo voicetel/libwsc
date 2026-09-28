@@ -223,8 +223,13 @@ void WebSocketContext::run() {
         return;
     }
 
-    dns_base = evdns_base_new(base, 1);
-    if (!dns_base) {
+    // An IP literal needs no resolver: with a null dns_base libevent parses the
+    // numeric host directly, which spares every connection a read of
+    // /etc/hosts and /etc/resolv.conf and a nameserver UDP socket.
+    if (!_cfg.is_ip_address) {
+        dns_base = evdns_base_new(base, EVDNS_BASE_INITIALIZE_NAMESERVERS);
+    }
+    if (!_cfg.is_ip_address && !dns_base) {
         log_error("Failed to create DNS base");
         sendError(ErrorCode::IO, "Failed to create DNS base");
         event_base_free(base);
