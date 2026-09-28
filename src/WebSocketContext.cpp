@@ -543,6 +543,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
             if (!ws_open) {
                 std::lock_guard<std::mutex> lk(send_queue_mutex);
                 send_queue.clear();
+                send_queue_bytes = 0;
             }
 
             if (ws_open && st == ConnectionState::DISCONNECTING) {
@@ -565,6 +566,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else {
@@ -588,6 +590,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else if (!graceful) {
@@ -828,6 +831,7 @@ void WebSocketContext::flushSendQueue() {
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
         local.swap(send_queue);
+        send_queue_bytes = 0;
     }
 
     const auto st = connection_state.load(std::memory_order_acquire);
@@ -985,7 +989,7 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
     // While CONNECTING: queue only
     if (state == ConnectionState::CONNECTING) {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
+        if (send_queue.size() >= MAX_QUEUE_SIZE || length > MAX_PENDING_BYTES - send_queue_bytes) {
             log_error("Send queue full—dropping packet");
             return false;
         }
@@ -1002,10 +1006,13 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
             );
         }
 
+        send_queue_bytes += length;
         log_debug("Queued %zu bytes during CONNECTING", length);
 
         return true;
     }
+
+    if (state != ConnectionState::CONNECTED || stop_requested.load(std::memory_order_acquire)) return false;
 
     // After CONNECTING:
     // Only event thread sends.
@@ -1021,7 +1028,7 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
     // Not event thread: queue and poke event loop (send_event)
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
+        if (send_queue.size() >= MAX_QUEUE_SIZE || length > MAX_PENDING_BYTES - send_queue_bytes) {
             log_error("Send queue full—dropping packet");
             return false;
         }
@@ -1038,6 +1045,7 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
                 )
             );
         }
+        send_queue_bytes += length;
     }
 
     requestSendFlush();
@@ -1072,6 +1080,15 @@ bool WebSocketContext::sendNow(const void* data, size_t length, MessageType type
     evbuffer* output = bufferevent_get_output(_bev);
     if (!output) {
         log_error("sendNow: No output buffer");
+        return false;
+    }
+
+    // Limit libevent's output as well as our pending queue; a slow reader
+    // otherwise makes the latter look empty while output grows indefinitely.
+    if (type != MessageType::CLOSE &&
+        (length > MAX_OUTPUT_BYTES - 14 ||
+         evbuffer_get_length(output) > MAX_OUTPUT_BYTES - 14 - length)) {
+        log_error("Socket output full—dropping packet");
         return false;
     }
 
