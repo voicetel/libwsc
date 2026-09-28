@@ -1162,6 +1162,53 @@ bool WebSocketContext::sendNow(const void* data, size_t length, MessageType type
     return true;
 }
 
+namespace {
+
+/*
+ * Frame-mask PRNG (xoshiro256**).
+ *
+ * RFC 6455 requires masks to be unpredictable to an attacker who controls
+ * the payload but cannot observe the wire. Seeding once per thread from
+ * std::random_device satisfies that without paying its per-call cost on
+ * every outgoing frame: depending on platform, random_device performs a
+ * syscall per call, or executes RDSEED which can take tens of microseconds
+ * on some CPUs (notably AMD), making small-frame workloads measurably
+ * slower. One strong 256-bit seed per thread keeps masks unpredictable
+ * at PRNG speed (~1ns/frame).
+ */
+struct MaskPrng {
+    uint64_t s[4];
+
+    MaskPrng() {
+        std::random_device rd;
+        for (auto& v : s) {
+            v = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint32_t>(rd());
+        }
+        // State must be non-zero
+        if ((s[0] | s[1] | s[2] | s[3]) == 0) {
+            s[3] = 0x9E3779B97F4A7C15ull;
+        }
+    }
+
+    static uint64_t rotl(uint64_t x, int k) {
+        return (x << k) | (x >> (64 - k));
+    }
+
+    uint32_t next32() {
+        const uint64_t r = rotl(s[1] * 5, 7) * 9;
+        const uint64_t t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = rotl(s[3], 45);
+        return static_cast<uint32_t>(r >> 32);
+    }
+};
+
+} // namespace
+
 void WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len, MessageType type) {
     const bool is_control_frame = (type == MessageType::CLOSE || type == MessageType::PING  || type == MessageType::PONG);
 
@@ -1220,9 +1267,9 @@ void WebSocketContext::send(evbuffer* buf, const void* raw_data, size_t raw_len,
     // ---- Fast masking (single evbuffer_add) ----
     uint8_t mask_key[4];
 
-    thread_local std::random_device rd;
+    thread_local MaskPrng mask_prng;
 
-    const uint32_t mask32 = static_cast<uint32_t>(rd());
+    const uint32_t mask32 = mask_prng.next32();
     std::memcpy(mask_key, &mask32, sizeof(mask_key));
 
     // Write mask key
