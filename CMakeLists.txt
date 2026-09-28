@@ -19,6 +19,7 @@ option(USE_TLS "Enable TLS/SSL support using OpenSSL" OFF)
 option(LIBWSC_USE_DEBUG "Enable debug (verbose) output" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries instead of static ones" OFF)
 option(LIBWSC_STRIP "Strip symbols from release builds" ON)
+option(LIBWSC_BUILD_TESTS "Build the integration tests (tests/run_tests.sh)" OFF)
 
 set(LIBEVENT_COMPONENTS libevent pthreads)
 
@@ -119,6 +120,10 @@ if (LIBWSC_STRIP)
   )
 endif()
 
+
+if (LIBWSC_BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
 
 install(TARGETS libwsc
   EXPORT libwscTargets

@@ -9,6 +9,23 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release-tls
+            build_type: Release
+            tls: "ON"
+            flags: ""
+          - name: release-notls
+            build_type: Release
+            tls: "OFF"
+            flags: ""
+          - name: asan-ubsan
+            build_type: RelWithDebInfo
+            tls: "ON"
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+    name: ${{ matrix.name }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -21,18 +38,24 @@ jobs:
             cmake \
             libevent-dev \
             zlib1g-dev \
-            libssl-dev
+            libssl-dev \
+            python3
 
       - name: Configure
         run: |
-          mkdir build
-          cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DUSE_TLS=ON \
-            -DUSE_DEBUG=OFF
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DUSE_TLS=${{ matrix.tls }} \
+            -DLIBWSC_USE_DEBUG=OFF \
+            -DLIBWSC_BUILD_TESTS=ON \
+            -DLIBWSC_STRIP=OFF \
+            -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
 
       - name: Build
-        run: |
-          cd build
-          cmake --build .
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: tests/run_tests.sh build
