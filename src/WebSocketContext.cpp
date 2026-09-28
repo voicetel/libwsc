@@ -11,6 +11,7 @@
   #include <openssl/err.h>
 #endif
 //#include <sstream>
+#include <pthread.h>
 
 static std::once_flag g_evthread_once;
 
@@ -337,6 +338,14 @@ void WebSocketContext::run() {
 
     log_debug("event loop exited, proceeding to cleanup()");
     running.store(false, std::memory_order_release);
+
+    // Every upgraded connection ends with exactly one close callback. Graceful
+    // paths have already fired it (one-shot guard); this reports the rest (ping
+    // timeout, EOF without CLOSE, transport/TLS error) as 1006, after the error
+    // callback that described the cause.
+    if (upgraded.load(std::memory_order_acquire)) {
+        sendCloseCallback(static_cast<int>(CloseCode::ABNORMAL), "Abnormal closure");
+    }
 
     cleanup();
 }
@@ -866,9 +875,16 @@ void WebSocketContext::handleRead(bufferevent* bev) {
                     cfg.compression_level = compression_level;
 
                     if (!receiver.initializeCompression(cfg)) {
+                        // The server accepted permessage-deflate and will send
+                        // compressed frames we cannot inflate; RFC 6455 §9.1
+                        // requires failing the connection.
                         log_error("Failed to initialize compression");
                         use_compression = false;
+                        connection_state.store(ConnectionState::FAILED, std::memory_order_release);
                         sendError(ErrorCode::NOT_SUPPORTED, "Compression negotiation failed");
+                        evbuffer_drain(input, len);
+                        requestLoopExit();
+                        return;
                     } else {
                         use_compression = true;
                     }
@@ -1012,12 +1028,13 @@ void WebSocketContext::sendHandshakeRequest() {
     const std::string uri  = stripCRLF(_cfg.uri);
     const std::string host = stripCRLF(_cfg.host);
 
+    // An IPv6 literal must be bracketed wherever it is followed by ":port".
+    const std::string authority = isIPv6Literal()
+        ? "[" + host + "]:" + std::to_string(_cfg.port)
+        : host + ":" + std::to_string(_cfg.port);
+
     evbuffer_add_printf(out, "GET %s HTTP/1.1\r\n", uri.c_str());
-    if (isIPv6Literal()) {
-        evbuffer_add_printf(out, "Host:[%s]:%d\r\n", host.c_str(), _cfg.port);
-    } else {
-        evbuffer_add_printf(out, "Host:%s:%d\r\n", host.c_str(), _cfg.port);
-    }
+    evbuffer_add_printf(out, "Host:%s\r\n", authority.c_str());
     evbuffer_add_printf(out, "Upgrade:websocket\r\n");
     evbuffer_add_printf(out, "Connection:upgrade\r\n");
     evbuffer_add_printf(out, "Sec-WebSocket-Key:%s\r\n", key.c_str());
@@ -1032,7 +1049,7 @@ void WebSocketContext::sendHandshakeRequest() {
             "client_max_window_bits=9\r\n");
     }
 
-    evbuffer_add_printf(out, "Origin:http://%s:%d\r\n", host.c_str(), _cfg.port);
+    evbuffer_add_printf(out, "Origin:http://%s\r\n", authority.c_str());
 
     if (!_cfg.headers.headers.empty()) {
         for (const auto& header : _cfg.headers.headers) {
@@ -1086,8 +1103,14 @@ bool WebSocketContext::close(int code, const std::string& reason) {
     }
 
     uint16_t code_be = htons(static_cast<uint16_t>(code));
+    // Control frames cap the reason at 123 bytes; cut on a UTF-8 boundary so
+    // the peer doesn't fail the close with 1007 over a split code point.
     std::string r = reason;
-    if (r.size() > 123) r.resize(123);
+    if (r.size() > 123) {
+        size_t cut = 123;
+        while (cut > 0 && (static_cast<unsigned char>(r[cut]) & 0xC0) == 0x80) --cut;
+        r.resize(cut);
+    }
 
     std::vector<uint8_t> payload(sizeof(code_be) + r.size());
     memcpy(payload.data(), &code_be, sizeof(code_be));
@@ -1249,11 +1272,31 @@ namespace {
  * on some CPUs (notably AMD), making small-frame workloads measurably
  * slower. One strong 256-bit seed per thread keeps masks unpredictable
  * at PRNG speed (~1ns/frame).
+ *
+ * A fork() child inherits the forking thread's state and would repeat the
+ * parent's mask sequence; an atfork handler bumps a generation counter so
+ * the child reseeds before its next frame.
  */
+std::atomic<unsigned> g_fork_generation{0};
+
+void onForkChild() {
+    g_fork_generation.fetch_add(1, std::memory_order_relaxed);
+}
+
 struct MaskPrng {
     uint64_t s[4];
+    unsigned generation;
 
     MaskPrng() {
+        static std::once_flag atfork_once;
+        std::call_once(atfork_once, [] {
+            pthread_atfork(nullptr, nullptr, &onForkChild);
+        });
+        seed();
+    }
+
+    void seed() {
+        generation = g_fork_generation.load(std::memory_order_relaxed);
         std::random_device rd;
         for (auto& v : s) {
             v = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint32_t>(rd());
@@ -1269,6 +1312,9 @@ struct MaskPrng {
     }
 
     uint32_t next32() {
+        if (generation != g_fork_generation.load(std::memory_order_relaxed)) {
+            seed();
+        }
         const uint64_t r = rotl(s[1] * 5, 7) * 9;
         const uint64_t t = s[1] << 17;
         s[2] ^= s[0];
