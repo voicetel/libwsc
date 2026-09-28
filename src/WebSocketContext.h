@@ -157,6 +157,8 @@ private:
     BinaryCallback on_binary;
 
     static const size_t MAX_QUEUE_SIZE = 1024;
+    static const size_t MAX_PENDING_BYTES = 4u * 1024u * 1024u;
+    static const size_t MAX_OUTPUT_BYTES = 4u * 1024u * 1024u;
 
     // Pending queue
     struct Pending {
@@ -169,6 +171,7 @@ private:
     };
 
     std::deque<Pending> send_queue;
+    size_t send_queue_bytes = 0;
     std::mutex send_queue_mutex;
     
     void flushSendQueue();
@@ -184,6 +187,10 @@ private:
     std::atomic_bool running{false};
 
     void sendHandshakeRequest();
+    // The host is stored bare; only an IPv6 address can contain ':'.
+    bool isIPv6Literal() const {
+        return _cfg.is_ip_address && _cfg.host.find(':') != std::string::npos;
+    }
 
     // Connection state
     std::atomic<bool> upgraded{false};
@@ -220,7 +227,10 @@ private:
     struct event *ping_event = nullptr;
     struct event *wakeup_event = nullptr;
 
-    // Ping liveness
+    // Heartbeat liveness: number of pings sent since the last pong. Touched only
+    // on the event thread (pingCallback / onRxPong). The connection is declared
+    // dead once this reaches MAX_MISSED_PONGS, detecting a half-open peer that
+    // stopped responding while TCP stayed up.
     int pings_outstanding = 0;
     static constexpr int MAX_MISSED_PONGS = 2;
 

@@ -68,7 +68,9 @@ int main() {
 
     WebSocketClient client;
 
-    // Configure endpoint ws:// or wss:// if using TLS
+    // Configure endpoint ws:// or wss:// if using TLS. An IPv6 address is
+    // bracketed ("ws://[::1]:3001") and connects over IPv6; hostnames resolve
+    // to IPv4 only, and an IP-address host skips the DNS resolver.
     client.setUrl("ws://localhost:3001");
 
     // compression (permessage-deflate) is enabled by default if supported by server and negotiated

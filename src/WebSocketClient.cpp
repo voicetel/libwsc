@@ -17,6 +17,9 @@ WebSocketClient::~WebSocketClient() {
 }
 
 bool WebSocketClient::isConnected() {
+    // _ctx is published/cleared from connect()/disconnect() on a different thread
+    // than the senders/isConnected callers (media thread). Access it atomically so
+    // the shared_ptr read never races the reset()/assign (TSan-verified).
     auto ctx = std::atomic_load(&_ctx);
     if (ctx) {
         return ctx->isConnected();
@@ -55,38 +58,65 @@ void WebSocketClient::setUrl(const std::string& url) {
     size_t path_pos = url.find('/', pos);
     std::string hostport = (path_pos == std::string::npos) ? url.substr(pos) : url.substr(pos, path_pos - pos);
 
-    size_t colon_pos = hostport.find(':');
+    // Split host[:port]. An IPv6 literal is bracketed ("[::1]:9000", RFC 3986)
+    // because the address itself contains ':'; the brackets are not part of
+    // the host, which is stored bare.
+    std::string new_host, port_str;
+    bool has_port = false;
+    if (!hostport.empty() && hostport[0] == '[') {
+        size_t close = hostport.find(']');
+        if (close == std::string::npos) {
+            return;
+        }
+        new_host = hostport.substr(1, close - 1);
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET6, new_host.c_str(), &addr6) != 1) {
+            return;
+        }
+        const std::string rest = hostport.substr(close + 1);
+        if (!rest.empty()) {
+            if (rest[0] != ':') {
+                return;
+            }
+            port_str = rest.substr(1);
+            has_port = true;
+        }
+    } else {
+        size_t colon_pos = hostport.find(':');
+        if (colon_pos != std::string::npos) {
+            new_host = hostport.substr(0, colon_pos);
+            port_str = hostport.substr(colon_pos + 1);
+            has_port = true;
+        } else {
+            new_host = hostport;
+        }
+    }
 
-    if (colon_pos != std::string::npos) {
-        host = hostport.substr(0, colon_pos);
+    if (new_host.empty()) {
+        return;
+    }
 
-        const std::string port_string = hostport.substr(colon_pos + 1);
-
+    int new_port = secure ? 443 : 80;
+    if (has_port) {
         try {
             size_t parsed = 0;
-            const int parsed_port = std::stoi(port_string, &parsed);
+            const int parsed_port = std::stoi(port_str, &parsed);
 
-            if (parsed != port_string.size() ||
+            if (parsed != port_str.size() ||
                 parsed_port < 1 ||
                 parsed_port > 65535) {
                 return;
             }
 
-            port = static_cast<unsigned short>(parsed_port);
+            new_port = parsed_port;
 
         } catch (const std::exception&) {
             return;
         }
-
-    } else {
-        host = hostport;
-        port = secure ? 443 : 80;
     }
 
-    if (host.empty()) {
-        return;
-    }
-
+    host = new_host;
+    port = new_port;
     uri = (path_pos == std::string::npos) ? "/" : url.substr(path_pos);
 
     is_ip_address = isHostIPAddress(host);
@@ -215,6 +245,10 @@ void WebSocketClient::connect() {
 }
 
 void WebSocketClient::disconnect() {
+    // Atomically take and clear _ctx so a concurrent sendBinary/isConnected
+    // either sees the old context (and keeps it alive via its own shared_ptr
+    // copy) or sees null — never a torn read. stop() (which joins the event
+    // thread) runs OUTSIDE the swap, so it can't deadlock a callback thread.
     auto ctx = std::atomic_exchange(&_ctx, std::shared_ptr<WebSocketContext>{});
     if (ctx) {
         ctx->stop();

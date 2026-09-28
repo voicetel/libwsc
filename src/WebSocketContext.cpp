@@ -60,6 +60,11 @@ void WebSocketContext::cleanup() {
     }
 
     if (dns_base) {
+        // evdns_base_free() closes each nameserver socket before deleting its
+        // event (libevent 2.1 evdns_nameserver_free), so the event_del issues
+        // epoll_ctl on an fd number another thread may already have reused.
+        // Clearing the nameservers first deletes the events, then closes.
+        evdns_base_clear_nameservers_and_suspend(dns_base);
         evdns_base_free(dns_base, 0);
         dns_base = nullptr;
     }
@@ -137,7 +142,10 @@ void WebSocketContext::start() {
 
 void WebSocketContext::run() {
 
-    event_tid = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        event_tid = std::this_thread::get_id();
+    }
 
     /*std::ostringstream oss;
     oss << event_tid;
@@ -196,7 +204,10 @@ void WebSocketContext::run() {
         if (!_cfg.tls.disableHostnameValidation) {
             X509_VERIFY_PARAM* param = SSL_get0_param(ssl);
             if (param) {
-                // Verify IP addresses against IP SANs, hostnames against DNS SANs.
+                // For an IP-literal endpoint the peer identity must be checked
+                // against the certificate's iPAddress SANs (set1_ip), not its
+                // dNSName SANs (set1_host); using set1_host on an IP would mis-
+                // validate. Hostnames use set1_host (no port matching).
                 int ret = _cfg.is_ip_address
                     ? X509_VERIFY_PARAM_set1_ip_asc(param, _cfg.host.c_str())
                     : X509_VERIFY_PARAM_set1_host(param, _cfg.host.c_str(), 0);
@@ -212,8 +223,9 @@ void WebSocketContext::run() {
             }
         }
 #else 
-        log_error("TLS support not compiled in (USE_TLS=OFF), proceeding in insecure mode");
-        _cfg.secure = false;
+        log_error("TLS support not compiled in (USE_TLS=OFF); refusing wss connection");
+        sendError(ErrorCode::TLS_INIT_FAILED, "TLS support not compiled in");
+        return;
 #endif
     }
 
@@ -226,8 +238,13 @@ void WebSocketContext::run() {
         return;
     }
 
-    dns_base = evdns_base_new(base, 1);
-    if (!dns_base) {
+    // An IP literal needs no resolver: with a null dns_base libevent parses the
+    // numeric host directly, which spares every connection a read of
+    // /etc/hosts and /etc/resolv.conf and a nameserver UDP socket.
+    if (!_cfg.is_ip_address) {
+        dns_base = evdns_base_new(base, EVDNS_BASE_INITIALIZE_NAMESERVERS);
+    }
+    if (!_cfg.is_ip_address && !dns_base) {
         log_error("Failed to create DNS base");
         sendError(ErrorCode::IO, "Failed to create DNS base");
         event_base_free(base);
@@ -271,10 +288,7 @@ void WebSocketContext::run() {
     if (sev) event_add(sev, nullptr);
     else { log_error("Failed to create send_event"); cleanup(); return; }
 
-    /*
-    * stop() may have been called before wakeup_event existed.
-    * In that case requestWakeup() could not notify this thread.
-    */
+    // stop() may have run before either event existed, losing its wakeup.
     if (stop_requested.load(std::memory_order_acquire)) {
         connection_state.store(
             ConnectionState::DISCONNECTED,
@@ -306,7 +320,11 @@ void WebSocketContext::run() {
 
     bufferevent_enable(_bev, EV_READ | EV_WRITE);
 
-    if (bufferevent_socket_connect_hostname(_bev, dns_base, AF_INET, _cfg.host.c_str(), _cfg.port) < 0) {
+    // IPv6 literals connect over IPv6. Hostnames keep resolving to IPv4 only:
+    // libevent tries just the first resolved address, so allowing AAAA answers
+    // would break hosts that publish one without a usable IPv6 route.
+    const int family = isIPv6Literal() ? AF_INET6 : AF_INET;
+    if (bufferevent_socket_connect_hostname(_bev, dns_base, family, _cfg.host.c_str(), _cfg.port) < 0) {
         log_error("Failed to start connection");
         sendError(ErrorCode::CONNECT_FAILED, "Failed to start connection");
         cleanup();
@@ -314,6 +332,7 @@ void WebSocketContext::run() {
     }
 
     running.store(true, std::memory_order_release);
+    if (stop_requested.load(std::memory_order_acquire)) requestWakeup();
     event_base_dispatch(base);
 
     log_debug("event loop exited, proceeding to cleanup()");
@@ -327,7 +346,11 @@ void WebSocketContext::stop() {
 
     requestWakeup();
 
-    const bool on_event_thread = (std::this_thread::get_id() == event_tid);
+    bool on_event_thread;
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        on_event_thread = (std::this_thread::get_id() == event_tid);
+    }
 
     if (event_thread.joinable()) {
         if (!on_event_thread) {
@@ -377,7 +400,7 @@ void WebSocketContext::timeoutCallback(evutil_socket_t /*fd*/, short /*event*/, 
 
 void WebSocketContext::pingCallback(evutil_socket_t /*fd*/, short /*event*/, void *arg) {
     auto* self = static_cast<WebSocketContext*>(arg);
-    // Heartbeat only runs after the WebSocket upgrade.
+    // Heartbeat only runs after the upgrade; sendPing() is a no-op before then.
     if (!self->upgraded.load(std::memory_order_acquire)) return;
 
     if (self->connection_state.load(std::memory_order_acquire) !=
@@ -385,7 +408,9 @@ void WebSocketContext::pingCallback(evutil_socket_t /*fd*/, short /*event*/, voi
         return;
     }
 
-    // Disconnect after too many unanswered pings.
+    // If earlier pings have gone unanswered for MAX_MISSED_PONGS intervals the
+    // peer is half-open (TCP up, no application response). Declare the
+    // connection dead, mirroring the fatal-error teardown in handleEvent.
     if (self->pings_outstanding >= MAX_MISSED_PONGS) {
         log_error("ping timeout: %d unanswered ping(s)", self->pings_outstanding);
         self->sendError(ErrorCode::PING_TIMEOUT, "Ping timeout (no pong)");
@@ -403,8 +428,11 @@ void WebSocketContext::wakeupCallback(evutil_socket_t, short, void* arg) {
 
     // If shutdown was requested, initiate shutdown logic ONCE.
     if (self->stop_requested.load(std::memory_order_acquire)) {
-        self->stopNow();     // does NOT necessarily exit loop immediately
-        return;              // do NOT flush app data on shutdown request
+        // Preserve application message ordering (including final metadata)
+        // before queueing the WebSocket close frame.
+        self->flushSendQueue();
+        self->stopNow();
+        return;
     }
 
     self->flushSendQueue();
@@ -447,12 +475,8 @@ void WebSocketContext::readCallback(bufferevent* bev, void* ctx) {
 }
 
 inline void WebSocketContext::requestWakeup() {
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = wakeup_event;
-    }
-    if (ev) event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (wakeup_event) event_active(wakeup_event, 0, 0);
 }
 
 inline void WebSocketContext::requestLoopExit() {
@@ -475,13 +499,9 @@ inline void WebSocketContext::requestSendFlush()
     if (send_flush_pending.exchange(true, std::memory_order_acq_rel))
         return;
 
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = send_event;
-    }
-    if (ev) {
-        event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (send_event) {
+        event_active(send_event, 0, 0);
     } else {
         // couldn't schedule, allow future attempts
         send_flush_pending.store(false, std::memory_order_release);
@@ -560,6 +580,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
             if (!ws_open) {
                 std::lock_guard<std::mutex> lk(send_queue_mutex);
                 send_queue.clear();
+                send_queue_bytes = 0;
             }
 
             if (ws_open && st == ConnectionState::DISCONNECTING) {
@@ -582,6 +603,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else {
@@ -605,6 +627,7 @@ void WebSocketContext::handleEvent(bufferevent* bev, short events) {
                 {
                     std::lock_guard<std::mutex> lk(send_queue_mutex);
                     send_queue.clear();
+                    send_queue_bytes = 0;
                 }
 
             } else if (!graceful) {
@@ -667,6 +690,9 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 
     if (!upgraded.load()) {
 
+        // Cap the pre-upgrade handshake response. Without this a server could
+        // stream header bytes forever (never sending the terminating CRLFCRLF),
+        // growing this buffer and re-scanning it from the start on every read.
         static constexpr size_t MAX_HANDSHAKE_BYTES = 64u * 1024u;
 
         const size_t len = evbuffer_get_length(input);
@@ -714,7 +740,11 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 
         //log_debug("RESP: %s", resp.c_str());
 
-        // RFC 6455: validate the HTTP 101 status and Sec-WebSocket-Accept value.
+        // RFC 6455 §4.1: the client MUST fail the connection unless the response
+        // is 101 AND Sec-WebSocket-Accept equals base64(SHA1(key + GUID)).
+        // Accepting on mere header presence would let any 101-returning endpoint
+        // (a stray HTTP responder, a cache, an off-path injector) masquerade as a
+        // valid WebSocket peer. `accept` was computed from our nonce at construction.
         auto headerValue = [&resp](const std::string& expectedName) -> std::string {
             size_t pos = 0;
 
@@ -857,10 +887,6 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 
         connection_state.store(ConnectionState::CONNECTED, std::memory_order_release);
 
-        // Send Pending Queue
-        log_debug("Flushing %zu queued messages…", send_queue.size());
-        flushSendQueue();
-
         OpenCallback cb;
         {
             std::lock_guard<std::mutex> lock(cb_mutex);
@@ -869,6 +895,10 @@ void WebSocketContext::handleRead(bufferevent* bev) {
         if (cb) {
             cb();
         }
+
+        // The open callback may send initial metadata; place it on the wire
+        // before any audio accumulated while the connection was opening.
+        flushSendQueue();
 
         log_debug("WebSocket connection upgraded successfully");
 
@@ -895,6 +925,7 @@ void WebSocketContext::flushSendQueue() {
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
         local.swap(send_queue);
+        send_queue_bytes = 0;
     }
 
     const auto st = connection_state.load(std::memory_order_acquire);
@@ -936,6 +967,18 @@ static bool hasInvalidHandshakeChars(const std::string& s) {
            s.find('\0') != std::string::npos;
 }
 
+// Strip CR/LF/NUL from a value interpolated into a request line, so a
+// configured URI/host/header cannot inject additional handshake headers or
+// smuggle a second request (header/request splitting).
+static std::string stripCRLF(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c != '\r' && c != '\n' && c != '\0') out.push_back(c);
+    }
+    return out;
+}
+
 void WebSocketContext::sendHandshakeRequest() {
     if (!_bev) return;
 
@@ -965,8 +1008,15 @@ void WebSocketContext::sendHandshakeRequest() {
 
     auto out = bufferevent_get_output(_bev);
 
-    evbuffer_add_printf(out, "GET %s HTTP/1.1\r\n", _cfg.uri.c_str());
-    evbuffer_add_printf(out, "Host:%s:%d\r\n", _cfg.host.c_str(), _cfg.port);
+    const std::string uri  = stripCRLF(_cfg.uri);
+    const std::string host = stripCRLF(_cfg.host);
+
+    evbuffer_add_printf(out, "GET %s HTTP/1.1\r\n", uri.c_str());
+    if (isIPv6Literal()) {
+        evbuffer_add_printf(out, "Host:[%s]:%d\r\n", host.c_str(), _cfg.port);
+    } else {
+        evbuffer_add_printf(out, "Host:%s:%d\r\n", host.c_str(), _cfg.port);
+    }
     evbuffer_add_printf(out, "Upgrade:websocket\r\n");
     evbuffer_add_printf(out, "Connection:upgrade\r\n");
     evbuffer_add_printf(out, "Sec-WebSocket-Key:%s\r\n", key.c_str());
@@ -981,16 +1031,14 @@ void WebSocketContext::sendHandshakeRequest() {
             "client_max_window_bits=9\r\n");
     }
 
-    evbuffer_add_printf(out,
-                       "Origin:http://%s:%d\r\n",
-                       _cfg.host.c_str(),
-                       _cfg.port);
+    evbuffer_add_printf(out, "Origin:http://%s:%d\r\n", host.c_str(), _cfg.port);
 
-    for (const auto& header : _cfg.headers.headers) {
-        evbuffer_add_printf(out,
-                            "%s:%s\r\n",
-                            header.first.c_str(),
-                            header.second.c_str());
+    if (!_cfg.headers.headers.empty()) {
+        for (const auto& header : _cfg.headers.headers) {
+            evbuffer_add_printf(out, "%s:%s\r\n",
+                                stripCRLF(header.first).c_str(),
+                                stripCRLF(header.second).c_str());
+        }
     }
 
     evbuffer_add_printf(out, "\r\n");
@@ -1072,7 +1120,7 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
     // While CONNECTING: queue only
     if (state == ConnectionState::CONNECTING) {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
+        if (send_queue.size() >= MAX_QUEUE_SIZE || length > MAX_PENDING_BYTES - send_queue_bytes) {
             log_error("Send queue full—dropping packet");
             return false;
         }
@@ -1089,21 +1137,29 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
             );
         }
 
+        send_queue_bytes += length;
         log_debug("Queued %zu bytes during CONNECTING", length);
 
         return true;
     }
 
+    if (state != ConnectionState::CONNECTED || stop_requested.load(std::memory_order_acquire)) return false;
+
     // After CONNECTING:
     // Only event thread sends.
-    if (std::this_thread::get_id() == event_tid) {
+    bool on_event_thread;
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        on_event_thread = (std::this_thread::get_id() == event_tid);
+    }
+    if (on_event_thread) {
         return sendNow(data, length, type);
     }
 
     // Not event thread: queue and poke event loop (send_event)
     {
         std::lock_guard<std::mutex> lk(send_queue_mutex);
-        if (send_queue.size() >= MAX_QUEUE_SIZE) {
+        if (send_queue.size() >= MAX_QUEUE_SIZE || length > MAX_PENDING_BYTES - send_queue_bytes) {
             log_error("Send queue full—dropping packet");
             return false;
         }
@@ -1120,6 +1176,7 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
                 )
             );
         }
+        send_queue_bytes += length;
     }
 
     requestSendFlush();
@@ -1154,6 +1211,15 @@ bool WebSocketContext::sendNow(const void* data, size_t length, MessageType type
     evbuffer* output = bufferevent_get_output(_bev);
     if (!output) {
         log_error("sendNow: No output buffer");
+        return false;
+    }
+
+    // Limit libevent's output as well as our pending queue; a slow reader
+    // otherwise makes the latter look empty while output grows indefinitely.
+    if (type != MessageType::CLOSE &&
+        (length > MAX_OUTPUT_BYTES - 14 ||
+         evbuffer_get_length(output) > MAX_OUTPUT_BYTES - 14 - length)) {
+        log_error("Socket output full—dropping packet");
         return false;
     }
 
@@ -1375,6 +1441,7 @@ bool WebSocketContext::rxCompressionEnabled() const {
 void WebSocketContext::onRxPong(std::vector<uint8_t>&& payload) {
     log_debug("Received pong frame (%zu bytes)", payload.size());
     (void)payload;
+    // Peer is alive; reset the heartbeat liveness counter.
     pings_outstanding = 0;
 }
 
