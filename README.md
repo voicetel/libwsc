@@ -25,6 +25,10 @@ It passes the Autobahn WebSocket Testsuite (including permessage-deflate) with p
 * CMake-based build for portability
 * **Very small footprint**: ~110 KB stripped shared library on x86_64 Linux (Release)
 
+### What’s new in v1.1.5
+
+* Fixed messages sent from a non-event thread occasionally sitting in the send queue until the next send (a lost wakeup when a send raced the queue flush, or landed just as the connection upgraded)
+
 ### What’s new in v1.1.4
 
 * **Faster frame masking**: masks now come from a per-thread xoshiro256\*\* PRNG seeded once from `std::random_device` — still RFC 6455–unpredictable, at ~1 ns/frame instead of a `random_device` call (a syscall, or a slow RDSEED on some CPUs) per frame
