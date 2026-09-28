@@ -25,6 +25,16 @@ It passes the Autobahn WebSocket Testsuite (including permessage-deflate) with p
 * CMake-based build for portability
 * **Very small footprint**: ~110 KB stripped shared library on x86_64 Linux (Release)
 
+### What’s new in v1.1.4
+
+* **Faster frame masking**: masks now come from a per-thread xoshiro256\*\* PRNG seeded once from `std::random_device` — still RFC 6455–unpredictable, at ~1 ns/frame instead of a `random_device` call (a syscall, or a slow RDSEED on some CPUs) per frame
+* **IPv6 literal hosts** (`ws://[::1]:3001`) connect over IPv6; IP-literal hosts skip the DNS resolver entirely
+* Fixed an evdns teardown race (nameserver events are removed before their sockets close)
+* `wss://` now fails closed when the library is built without TLS support (`USE_TLS=OFF`)
+* Heartbeat/lifecycle: pong frames reset the liveness counter; shutdown preserves application message ordering (final metadata is flushed before the close frame)
+* Send path is additionally bounded by bytes: queued and socket-output bytes are capped (4 MiB each) on top of the 1024-message queue limit
+* Includes the v1.1.1–v1.1.3 protocol hardening: bounded handshake/frame/message/deflate sizes, CR/LF injection rejection, strict 101 + `Sec-WebSocket-Accept` validation, IP-literal TLS SAN verification, and half-open peer detection
+
 ### What’s new in v1.1.0
 
 * Completely redesigned internal architecture based on an event-driven model
