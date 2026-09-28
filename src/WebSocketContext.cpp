@@ -459,9 +459,10 @@ void WebSocketContext::sendCallback(evutil_socket_t /*fd*/, short /*events*/, vo
     auto* self = static_cast<WebSocketContext*>(arg);
     if (!self || !self->base) return;
 
-    self->flushSendQueue();
-    // After flushing mark the flag
+    // Clear the flag before draining: a producer that enqueues during the
+    // flush must be able to schedule another pass, or its message is stranded.
     self->send_flush_pending.store(false, std::memory_order_release);
+    self->flushSendQueue();
 }
 
 void WebSocketContext::eventCallback(bufferevent* bev, short events, void* ctx) {
@@ -1139,7 +1140,14 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
 
         send_queue_bytes += length;
         log_debug("Queued %zu bytes during CONNECTING", length);
+    }
 
+    // The upgrade may have flushed the queue between our state check and the
+    // enqueue above; if so, schedule another pass so this message isn't stranded.
+    if (state == ConnectionState::CONNECTING) {
+        if (connection_state.load(std::memory_order_acquire) == ConnectionState::CONNECTED) {
+            requestSendFlush();
+        }
         return true;
     }
 
