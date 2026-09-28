@@ -25,6 +25,16 @@ It passes the Autobahn WebSocket Testsuite (including permessage-deflate) with p
 * CMake-based build for portability
 * **Very small footprint**: ~110 KB stripped shared library on x86_64 Linux (Release)
 
+### What’s new in v1.1.6
+
+* **Behavior change — close callback:** every connection that opened now ends with exactly one close callback. Abnormal ends (ping timeout, peer dropping TCP without a CLOSE, transport/TLS error) report **1006** after the error callback; previously they fired only the error callback. See [Callback semantics](docs/OPTIONS.md#callback-semantics)
+* A connection now fails (RFC 6455 §9.1) if the server accepts permessage-deflate but the client cannot initialize it, instead of continuing and rejecting the server's compressed frames
+* The `Origin` header brackets IPv6 literals (`http://[::1]:3001`)
+* After `fork()`, a child reseeds the frame-mask PRNG instead of repeating the parent's mask sequence
+* Close reasons longer than 123 bytes are truncated on a UTF-8 boundary
+* Integration tests (`tests/`, `-DLIBWSC_BUILD_TESTS=ON`) now run in CI, including under ASan/UBSan
+* Docs: the connection timeout default is 1s (the docs said 2s); ping-timeout behavior and callback semantics are documented
+
 ### What’s new in v1.1.5
 
 * Fixed messages sent from a non-event thread occasionally sitting in the send queue until the next send (a lost wakeup when a send raced the queue flush, or landed just as the connection upgraded)
