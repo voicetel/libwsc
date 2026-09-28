@@ -60,6 +60,11 @@ void WebSocketContext::cleanup() {
     }
 
     if (dns_base) {
+        // evdns_base_free() closes each nameserver socket before deleting its
+        // event (libevent 2.1 evdns_nameserver_free), so the event_del issues
+        // epoll_ctl on an fd number another thread may already have reused.
+        // Clearing the nameservers first deletes the events, then closes.
+        evdns_base_clear_nameservers_and_suspend(dns_base);
         evdns_base_free(dns_base, 0);
         dns_base = nullptr;
     }
