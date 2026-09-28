@@ -24,6 +24,8 @@ Shared builds are available via `-DBUILD_SHARED_LIBS=ON`, but static is the defa
   - -DUSE_TLS=ON, **OFF** by default (TLS support)
   - -DLIBWSC_USE_DEBUG=ON, **OFF** by default (verbose debugging, logs to stdout|stderr or syslog)
   - -DBUILD_SHARED_LIBS=ON, **OFF** by default
+  - -DLIBWSC_STRIP=OFF, **ON** by default (strip symbols from Release builds)
+  - -DLIBWSC_BUILD_TESTS=ON, **OFF** by default (integration tests, see below)
 
 The easiest way is to clone the repository and use it in your cmake project via `add_sudirectory()`. You can also build a shared library:
 
@@ -66,3 +68,27 @@ target_link_libraries(myapp PRIVATE libwsc::libwsc)
 ```
 
 ---
+---
+
+## Running the tests
+
+The integration tests drive the client against a small stdlib-only Python
+RFC 6455 server (`tests/ws_test_server.py`); they need `python3` and a
+loopback interface with IPv4 and IPv6.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_TLS=ON -DLIBWSC_BUILD_TESTS=ON
+cmake --build build
+tests/run_tests.sh build
+```
+
+| Test | Covers |
+| --- | --- |
+| `functional_v4`, `functional_v6` | text, binary, 1 MiB, fragmented echo, server-initiated close, frame masking/mask uniqueness; IPv6 literal URL and bracketed `Origin` |
+| `stall` | messages sent from another thread are never stranded in the send queue |
+| `close_disconnect` | client-initiated close: one close callback (1000), no error |
+| `close_nopong` | peer ignores pings: `PING_TIMEOUT` error, then one close callback (1006) |
+| `close_drop` | peer drops TCP without CLOSE: `IO` error, then one close callback (1006) |
+
+For sanitizer runs, add e.g. `-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined
+-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined -DLIBWSC_STRIP=OFF`.
