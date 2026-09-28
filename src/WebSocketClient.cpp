@@ -45,23 +45,55 @@ void WebSocketClient::setUrl(const std::string& url) {
     size_t path_pos = url.find('/', pos);
     std::string hostport = (path_pos == std::string::npos) ? url.substr(pos) : url.substr(pos, path_pos - pos);
 
-    size_t colon_pos = hostport.find(':');
-    if (colon_pos != std::string::npos) {
-        host = hostport.substr(0, colon_pos);
-        try {
-            port = std::stoi(hostport.substr(colon_pos + 1));
-        } catch (const std::exception& e) {
+    // Split host[:port]. An IPv6 literal is bracketed ("[::1]:9000", RFC 3986)
+    // because the address itself contains ':'; the brackets are not part of
+    // the host, which is stored bare.
+    std::string new_host, port_str;
+    bool has_port = false;
+    if (!hostport.empty() && hostport[0] == '[') {
+        size_t close = hostport.find(']');
+        if (close == std::string::npos) {
             return;
         }
+        new_host = hostport.substr(1, close - 1);
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET6, new_host.c_str(), &addr6) != 1) {
+            return;
+        }
+        const std::string rest = hostport.substr(close + 1);
+        if (!rest.empty()) {
+            if (rest[0] != ':') {
+                return;
+            }
+            port_str = rest.substr(1);
+            has_port = true;
+        }
     } else {
-        host = hostport;
-        port = secure ? 443 : 80;
+        size_t colon_pos = hostport.find(':');
+        if (colon_pos != std::string::npos) {
+            new_host = hostport.substr(0, colon_pos);
+            port_str = hostport.substr(colon_pos + 1);
+            has_port = true;
+        } else {
+            new_host = hostport;
+        }
     }
 
-    if (host.empty()) {
+    if (new_host.empty()) {
         return;
     }
 
+    int new_port = secure ? 443 : 80;
+    if (has_port) {
+        try {
+            new_port = std::stoi(port_str);
+        } catch (const std::exception& e) {
+            return;
+        }
+    }
+
+    host = new_host;
+    port = new_port;
     uri = (path_pos == std::string::npos) ? "/" : url.substr(path_pos);
 
     is_ip_address = isHostIPAddress(host);

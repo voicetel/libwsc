@@ -186,6 +186,10 @@ private:
     std::atomic_bool running{false};
 
     void sendHandshakeRequest();
+    // The host is stored bare; only an IPv6 address can contain ':'.
+    bool isIPv6Literal() const {
+        return _cfg.is_ip_address && _cfg.host.find(':') != std::string::npos;
+    }
 
     // Connection state
     std::atomic<bool> upgraded{false};

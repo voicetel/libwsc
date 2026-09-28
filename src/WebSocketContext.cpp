@@ -302,7 +302,11 @@ void WebSocketContext::run() {
 
     bufferevent_enable(_bev, EV_READ | EV_WRITE);
 
-    if (bufferevent_socket_connect_hostname(_bev, dns_base, AF_INET, _cfg.host.c_str(), _cfg.port) < 0) {
+    // IPv6 literals connect over IPv6. Hostnames keep resolving to IPv4 only:
+    // libevent tries just the first resolved address, so allowing AAAA answers
+    // would break hosts that publish one without a usable IPv6 route.
+    const int family = isIPv6Literal() ? AF_INET6 : AF_INET;
+    if (bufferevent_socket_connect_hostname(_bev, dns_base, family, _cfg.host.c_str(), _cfg.port) < 0) {
         log_error("Failed to start connection");
         sendError(ErrorCode::CONNECT_FAILED, "Failed to start connection");
         cleanup();
@@ -899,7 +903,11 @@ void WebSocketContext::sendHandshakeRequest() {
     const std::string host = stripCRLF(_cfg.host);
 
     evbuffer_add_printf(out, "GET %s HTTP/1.1\r\n", uri.c_str());
-    evbuffer_add_printf(out, "Host:%s:%d\r\n", host.c_str(), _cfg.port);
+    if (isIPv6Literal()) {
+        evbuffer_add_printf(out, "Host:[%s]:%d\r\n", host.c_str(), _cfg.port);
+    } else {
+        evbuffer_add_printf(out, "Host:%s:%d\r\n", host.c_str(), _cfg.port);
+    }
     evbuffer_add_printf(out, "Upgrade:websocket\r\n");
     evbuffer_add_printf(out, "Connection:upgrade\r\n");
     evbuffer_add_printf(out, "Sec-WebSocket-Key:%s\r\n", key.c_str());
