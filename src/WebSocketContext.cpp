@@ -137,7 +137,10 @@ void WebSocketContext::start() {
 
 void WebSocketContext::run() {
 
-    event_tid = std::this_thread::get_id();
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        event_tid = std::this_thread::get_id();
+    }
 
     /*std::ostringstream oss;
     oss << event_tid;
@@ -260,6 +263,12 @@ void WebSocketContext::run() {
     if (sev) event_add(sev, nullptr);
     else { log_error("Failed to create send_event"); cleanup(); return; }
 
+    // stop() may have run before either event existed, losing its wakeup.
+    if (stop_requested.load(std::memory_order_acquire)) {
+        cleanup();
+        return;
+    }
+
     
     struct timeval timeout;
     timeout.tv_sec = _cfg.connection_timeout;
@@ -291,6 +300,7 @@ void WebSocketContext::run() {
     }
 
     running.store(true, std::memory_order_release);
+    if (stop_requested.load(std::memory_order_acquire)) requestWakeup();
     event_base_dispatch(base);
 
     log_debug("event loop exited, proceeding to cleanup()");
@@ -304,7 +314,11 @@ void WebSocketContext::stop() {
 
     requestWakeup();
 
-    const bool on_event_thread = (std::this_thread::get_id() == event_tid);
+    bool on_event_thread;
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        on_event_thread = (std::this_thread::get_id() == event_tid);
+    }
 
     if (event_thread.joinable()) {
         if (!on_event_thread) {
@@ -421,12 +435,8 @@ void WebSocketContext::readCallback(bufferevent* bev, void* ctx) {
 }
 
 inline void WebSocketContext::requestWakeup() {
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = wakeup_event;
-    }
-    if (ev) event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (wakeup_event) event_active(wakeup_event, 0, 0);
 }
 
 inline void WebSocketContext::requestLoopExit() {
@@ -449,13 +459,9 @@ inline void WebSocketContext::requestSendFlush()
     if (send_flush_pending.exchange(true, std::memory_order_acq_rel))
         return;
 
-    event* ev = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(base_mutex);
-        ev = send_event;
-    }
-    if (ev) {
-        event_active(ev, 0, 0);
+    std::lock_guard<std::mutex> lk(base_mutex);
+    if (send_event) {
+        event_active(send_event, 0, 0);
     } else {
         // couldn't schedule, allow future attempts
         send_flush_pending.store(false, std::memory_order_release);
@@ -1000,7 +1006,12 @@ bool WebSocketContext::sendData(const void* data, size_t length, MessageType typ
 
     // After CONNECTING:
     // Only event thread sends.
-    if (std::this_thread::get_id() == event_tid) {
+    bool on_event_thread;
+    {
+        std::lock_guard<std::mutex> lk(base_mutex);
+        on_event_thread = (std::this_thread::get_id() == event_tid);
+    }
+    if (on_event_thread) {
         return sendNow(data, length, type);
     }
 
