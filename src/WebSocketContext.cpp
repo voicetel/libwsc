@@ -200,8 +200,9 @@ void WebSocketContext::run() {
             }
         }
 #else 
-        log_error("TLS support not compiled in (USE_TLS=OFF), proceeding in insecure mode");
-        _cfg.secure = false;
+        log_error("TLS support not compiled in (USE_TLS=OFF); refusing wss connection");
+        sendError(ErrorCode::TLS_INIT_FAILED, "TLS support not compiled in");
+        return;
 #endif
     }
 
