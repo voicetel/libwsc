@@ -391,8 +391,11 @@ void WebSocketContext::wakeupCallback(evutil_socket_t, short, void* arg) {
 
     // If shutdown was requested, initiate shutdown logic ONCE.
     if (self->stop_requested.load(std::memory_order_acquire)) {
-        self->stopNow();     // does NOT necessarily exit loop immediately
-        return;              // do NOT flush app data on shutdown request
+        // Preserve application message ordering (including final metadata)
+        // before queueing the WebSocket close frame.
+        self->flushSendQueue();
+        self->stopNow();
+        return;
     }
 
     self->flushSendQueue();
@@ -787,10 +790,6 @@ void WebSocketContext::handleRead(bufferevent* bev) {
 
         connection_state.store(ConnectionState::CONNECTED, std::memory_order_release);
 
-        // Send Pending Queue
-        log_debug("Flushing %zu queued messages…", send_queue.size());
-        flushSendQueue();
-
         OpenCallback cb;
         {
             std::lock_guard<std::mutex> lock(cb_mutex);
@@ -799,6 +798,10 @@ void WebSocketContext::handleRead(bufferevent* bev) {
         if (cb) {
             cb();
         }
+
+        // The open callback may send initial metadata; place it on the wire
+        // before any audio accumulated while the connection was opening.
+        flushSendQueue();
 
         log_debug("WebSocket connection upgraded successfully");
 
